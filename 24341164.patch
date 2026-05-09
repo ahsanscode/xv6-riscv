@@ -1,0 +1,244 @@
+diff --git a/Makefile b/Makefile
+index b262c0a..e3b1392 100644
+--- a/Makefile
++++ b/Makefile
+@@ -145,6 +145,7 @@ UPROGS=\
+ 	$U/_logstress\
+ 	$U/_forphan\
+ 	$U/_dorphan\
++	$U/_test_scheduler\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+@@ -166,7 +167,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
+ 	then echo "-gdb tcp::$(GDBPORT)"; \
+ 	else echo "-s -p $(GDBPORT)"; fi)
+ ifndef CPUS
+-CPUS := 3
++CPUS := 1
+ endif
+ 
+ QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22a5401..ad2b05d 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -5,7 +5,26 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "defs.h"
++int do_rand(unsigned long *ctx) {
++    long hi, lo, x;
++
++    x = (*ctx % 0x7ffffffe) + 1;
++    hi = x / 127773;
++    lo = x % 127773;
++    x = 16807 * lo - 2836 * hi;
++    if (x < 0)
++        x += 0x7fffffff;
++
++    x--;
++    *ctx = x;
++    return (x);
++}
++
++unsigned long rand_next = 1;
+ 
++int rand(void) {
++    return (do_rand(&rand_next));
++}
+ struct cpu cpus[NCPU];
+ 
+ struct proc proc[NPROC];
+@@ -119,6 +138,7 @@ allocproc(void)
+       release(&p->lock);
+     }
+   }
++  p->rounds = 0;
+   return 0;
+ 
+ found:
+@@ -222,6 +242,7 @@ userinit(void)
+   struct proc *p;
+ 
+   p = allocproc();
++  p->tickets = 10;
+   initproc = p;
+   
+   p->cwd = namei("/");
+@@ -275,7 +296,7 @@ kfork(void)
+     return -1;
+   }
+   np->sz = p->sz;
+-
++np->tickets = p->tickets;
+   // copy saved user registers.
+   *(np->trapframe) = *(p->trapframe);
+ 
+@@ -438,23 +459,38 @@ scheduler(void)
+     intr_off();
+ 
+     int found = 0;
+-    for(p = proc; p < &proc[NPROC]; p++) {
+-      acquire(&p->lock);
+-      if(p->state == RUNNABLE) {
+-        // Switch to chosen process.  It is the process's job
+-        // to release its lock and then reacquire it
+-        // before jumping back to us.
++   // 1. Count total tickets
++int total_tickets = 0;
++for(p = proc; p < &proc[NPROC]; p++) {
++  acquire(&p->lock);
++  if(p->state == RUNNABLE) {
++    total_tickets += p->tickets;
++  }
++  release(&p->lock);
++}
++
++// 2. Pick winner and run
++if (total_tickets > 0) {
++  int winning_ticket = rand() % total_tickets;
++  int current_tickets = 0;
++
++  for(p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if(p->state == RUNNABLE) {
++      current_tickets += p->tickets;
++      if(current_tickets > winning_ticket) {
++        p->rounds++; // Increment rounds
+         p->state = RUNNING;
+         c->proc = p;
+         swtch(&c->context, &p->context);
+-
+-        // Process is done running for now.
+-        // It should have changed its p->state before coming back.
+         c->proc = 0;
+-        found = 1;
++        release(&p->lock);
++        break; // Stop looking once the winner runs
+       }
+-      release(&p->lock);
+     }
++    release(&p->lock);
++  }
++}
+     if(found == 0) {
+       // nothing to run; stop running on this core until an interrupt.
+       asm volatile("wfi");
+@@ -684,7 +720,7 @@ procdump(void)
+       state = states[p->state];
+     else
+       state = "???";
+-    printf("%d %s %s", p->pid, state, p->name);
++printf("%d %s %s tickets:%d rounds:%d", p->pid, state, p->name, p->tickets, p->rounds);
+     printf("\n");
+   }
+ }
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..72d47c2 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -103,5 +103,7 @@ struct proc {
+   struct context context;      // swtch() here to run process
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+-  char name[16];               // Process name (debugging)
++  char name[16];
++  int tickets;
++  int rounds;               // Process name (debugging)
+ };
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 076d965..dd2450e 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,7 +101,7 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
+-
++extern uint64 sys_settickets(void);
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+ static uint64 (*syscalls[])(void) = {
+@@ -126,6 +126,7 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_settickets] sys_settickets,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 3dd926d..f085330 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_settickets 22
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 419e727..c52cca7 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -107,3 +107,11 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++uint64 sys_settickets(void) {
++  int n;
++  argint(0, &n);
++  if(n > 0) {
++    myproc()->tickets = n;
++  }
++  return 0;
++}
+\ No newline at end of file
+diff --git a/user/test_scheduler.c b/user/test_scheduler.c
+new file mode 100644
+index 0000000..abb5de5
+--- /dev/null
++++ b/user/test_scheduler.c
+@@ -0,0 +1,18 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int main(int argc, char *argv[]) {
++  if(argc != 2) {
++    fprintf(2, "Usage: test_scheduler <tickets>\n");
++    exit(1);
++  }
++
++  int tickets = atoi(argv[1]);
++  settickets(tickets);
++
++  // Infinite loop to keep process alive
++  while(1) {}; 
++
++  exit(0);
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index ac84de9..6c3bf77 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -1,5 +1,5 @@
+ #define SBRK_ERROR ((char *)-1)
+-
++int settickets(int);
+ struct stat;
+ 
+ // system calls
+diff --git a/user/usys.pl b/user/usys.pl
+index c5d4c3a..1ebbabf 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -42,3 +42,4 @@ entry("getpid");
+ entry("sbrk");
+ entry("pause");
+ entry("uptime");
++entry("settickets");
+\ No newline at end of file
+ 
