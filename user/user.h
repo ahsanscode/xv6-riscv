@@ -1,5 +1,5 @@
 #define SBRK_ERROR ((char *)-1)
-
+int settickets(int);
 struct stat;
 
 // system calls

@@ -5,7 +5,26 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+int do_rand(unsigned long *ctx) {
+    long hi, lo, x;
 
+    x = (*ctx % 0x7ffffffe) + 1;
+    hi = x / 127773;
+    lo = x % 127773;
+    x = 16807 * lo - 2836 * hi;
+    if (x < 0)
+        x += 0x7fffffff;
+
+    x--;
+    *ctx = x;
+    return (x);
+}
+
+unsigned long rand_next = 1;
+
+int rand(void) {
+    return (do_rand(&rand_next));
+}
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
@@ -119,6 +138,7 @@ allocproc(void)
       release(&p->lock);
     }
   }
+  p->rounds = 0;
   return 0;
 
 found:
@@ -222,6 +242,7 @@ userinit(void)
   struct proc *p;
 
   p = allocproc();
+  p->tickets = 10;
   initproc = p;
   
   p->cwd = namei("/");
@@ -275,7 +296,7 @@ kfork(void)
     return -1;
   }
   np->sz = p->sz;
-
+np->tickets = p->tickets;
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
 
@@ -438,23 +459,38 @@ scheduler(void)
     intr_off();
 
     int found = 0;
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
+   // 1. Count total tickets
+int total_tickets = 0;
+for(p = proc; p < &proc[NPROC]; p++) {
+  acquire(&p->lock);
+  if(p->state == RUNNABLE) {
+    total_tickets += p->tickets;
+  }
+  release(&p->lock);
+}
+
+// 2. Pick winner and run
+if (total_tickets > 0) {
+  int winning_ticket = rand() % total_tickets;
+  int current_tickets = 0;
+
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->state == RUNNABLE) {
+      current_tickets += p->tickets;
+      if(current_tickets > winning_ticket) {
+        p->rounds++; // Increment rounds
         p->state = RUNNING;
         c->proc = p;
         swtch(&c->context, &p->context);
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
         c->proc = 0;
-        found = 1;
+        release(&p->lock);
+        break; // Stop looking once the winner runs
       }
-      release(&p->lock);
     }
+    release(&p->lock);
+  }
+}
     if(found == 0) {
       // nothing to run; stop running on this core until an interrupt.
       asm volatile("wfi");
@@ -684,7 +720,7 @@ procdump(void)
       state = states[p->state];
     else
       state = "???";
-    printf("%d %s %s", p->pid, state, p->name);
+printf("%d %s %s tickets:%d rounds:%d", p->pid, state, p->name, p->tickets, p->rounds);
     printf("\n");
   }
 }
